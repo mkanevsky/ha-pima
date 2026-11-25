@@ -439,11 +439,19 @@ class ModernAdapter(PimaAdapter):
                 if not chunk:
                     _LOGGER.info("Force panel closed the connection")
                     break
-                buf += _decode_chunk(chunk)
+                # null heartbeats are padded to 250 bytes with 0x00; drop them
+                # or they wedge the decoder and every later frame is lost.
+                buf += _decode_chunk(chunk).replace("\x00", "")
                 while buf:
                     buf = buf.lstrip()  # drop leading whitespace between objects
                     if not buf:
                         break
+                    if buf[0] != "{":
+                        # Skip any stray bytes up to the next frame.
+                        nxt = buf.find("{")
+                        _LOGGER.debug("Skipping non-JSON bytes: %r", buf[: nxt if nxt >= 0 else 40])
+                        buf = buf[nxt:] if nxt >= 0 else ""
+                        continue
                     try:
                         obj, idx = decoder.raw_decode(buf)
                     except json.JSONDecodeError:

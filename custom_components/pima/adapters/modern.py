@@ -99,6 +99,18 @@ _SETTLE_SECONDS = 2             # let the panel finish flushing its event buffer
 _COUNTER_ROLLOVER = 10_000      # spec §4.4 — rolls over after 9999
 
 
+def _decode_chunk(chunk: bytes) -> str:
+    """Force panels send Hebrew names in Windows-1255, not UTF-8.
+
+    The JSON framing itself is ASCII, so decoding the whole chunk as
+    cp1255 is safe. Valid UTF-8 is still accepted as-is.
+    """
+    try:
+        return chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return chunk.decode("cp1255", errors="replace")
+
+
 class ModernAdapter(PimaAdapter):
     """Force / Vision adapter — HA acts as TCP server for the panel."""
 
@@ -371,7 +383,7 @@ class ModernAdapter(PimaAdapter):
                 if not chunk:
                     _LOGGER.info("Force panel closed the connection")
                     break
-                buf += chunk.decode("utf-8", errors="replace")
+                buf += _decode_chunk(chunk)
                 while buf:
                     buf = buf.lstrip()  # drop leading whitespace between objects
                     if not buf:

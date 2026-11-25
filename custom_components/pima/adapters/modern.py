@@ -111,6 +111,52 @@ def _decode_chunk(chunk: bytes) -> str:
         return chunk.decode("cp1255", errors="replace")
 
 
+class _SharedListener:
+    """One TCP listener per port that outlives individual setup attempts.
+
+    HA tears the adapter down between setup retries. If the listener went
+    with it, a panel dialing in between attempts got "connection refused"
+    and backed off, so the two kept missing each other. The listener stays
+    bound; a connection arriving with no adapter attached is parked and
+    handed to the next adapter that calls connect().
+    """
+
+    def __init__(self) -> None:
+        self.server: asyncio.AbstractServer | None = None
+        self.owner: "ModernAdapter | None" = None
+        self.parked: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
+
+    async def on_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        if self.owner is not None:
+            await self.owner._handle_client(reader, writer)
+            return
+        _LOGGER.info(
+            "Force panel connected from %s; holding it for the next setup attempt",
+            writer.get_extra_info("peername"),
+        )
+        self.drop_parked()
+        self.parked = (reader, writer)
+
+    def take_parked(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+        parked, self.parked = self.parked, None
+        if parked is None:
+            return None
+        reader, writer = parked
+        if writer.is_closing() or reader.at_eof():
+            return None
+        return parked
+
+    def drop_parked(self) -> None:
+        if self.parked is not None:
+            self.parked[1].close()
+            self.parked = None
+
+
+_LISTENERS: dict[tuple[str, int], _SharedListener] = {}
+
+
 class ModernAdapter(PimaAdapter):
     """Force / Vision adapter — HA acts as TCP server for the panel."""
 
@@ -125,7 +171,7 @@ class ModernAdapter(PimaAdapter):
         self._listen_host = listen_host
         self._password = password
         self._account = account  # may be None — auto-filled from first frame
-        self._server: asyncio.AbstractServer | None = None
+        self._listener: _SharedListener | None = None
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connection_event = asyncio.Event()
@@ -146,15 +192,25 @@ class ModernAdapter(PimaAdapter):
     # ─── PimaAdapter surface ──────────────────────────────────────────────
 
     async def connect(self) -> None:
-        """Open the listener and wait for the panel to dial in."""
-        try:
-            self._server = await asyncio.start_server(
-                self._handle_client, host=self._listen_host, port=self._listen_port
-            )
-        except OSError as err:
-            raise AdapterConnectError(
-                f"Couldn't bind TCP port {self._listen_port}: {err}"
-            ) from err
+        """Attach to the (persistent) listener and wait for the panel."""
+        key = (self._listen_host, self._listen_port)
+        listener = _LISTENERS.get(key)
+        if listener is None or listener.server is None:
+            listener = _SharedListener()
+            try:
+                listener.server = await asyncio.start_server(
+                    listener.on_client, host=self._listen_host, port=self._listen_port
+                )
+            except OSError as err:
+                raise AdapterConnectError(
+                    f"Couldn't bind TCP port {self._listen_port}: {err}"
+                ) from err
+            _LISTENERS[key] = listener
+        listener.owner = self
+        self._listener = listener
+        parked = listener.take_parked()
+        if parked is not None:
+            await self._handle_client(*parked)
         _LOGGER.info(
             "Force adapter listening on %s:%d — waiting for panel to connect",
             self._listen_host, self._listen_port,
@@ -426,13 +482,11 @@ class ModernAdapter(PimaAdapter):
                 pass
             self._writer = None
             self._reader = None
-        if self._server is not None:
-            self._server.close()
-            try:
-                await self._server.wait_closed()
-            except (asyncio.TimeoutError, OSError):
-                pass
-            self._server = None
+        # Detach from the shared listener but keep it bound, so a panel
+        # dialing in before the next setup attempt isn't refused.
+        if self._listener is not None and self._listener.owner is self:
+            self._listener.owner = None
+        self._listener = None
         self._connection_event.clear()
         self._first_frame_event.clear()
 

@@ -94,6 +94,8 @@ _ZONE_BIT_FIRE = 13
 _FRAME_SIZE_LIMIT = 250         # spec §4.6.5 (HA→AS direction)
 _CONNECT_TIMEOUT_SECONDS = 60   # how long to wait for the panel to dial in
 _REQUEST_TIMEOUT_SECONDS = 10   # ACK/DATA response budget per outbound request
+_FIRST_FRAME_TIMEOUT_SECONDS = 30  # wait for the panel's first frame before querying
+_SETTLE_SECONDS = 2             # let the panel finish flushing its event buffer
 _COUNTER_ROLLOVER = 10_000      # spec §4.4 — rolls over after 9999
 
 
@@ -115,6 +117,8 @@ class ModernAdapter(PimaAdapter):
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._connection_event = asyncio.Event()
+        # Set when the panel sends its first frame after connecting.
+        self._first_frame_event = asyncio.Event()
         self._counter = 1
         self._cached_status = PimaStatus(logged_in=False)
         self._zone_count = 0
@@ -160,7 +164,24 @@ class ModernAdapter(PimaAdapter):
         requesting a status read and seeing if the panel ACKs. While we're
         at it, pull the configuration data (zone names, user names) so the
         entity layer can use real labels."""
-        status = await self.get_status()
+        # The panel ignores requests sent the instant it connects (it first
+        # flushes its own event buffer). Wait for its first frame, let the
+        # burst settle, and retry the first status read once.
+        try:
+            await asyncio.wait_for(
+                self._first_frame_event.wait(), timeout=_FIRST_FRAME_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.debug("No frame from panel yet; trying a status read anyway")
+        await asyncio.sleep(_SETTLE_SECONDS)
+        try:
+            status = await self.get_status()
+        except AdapterAuthError:
+            raise
+        except AdapterError as err:
+            _LOGGER.info("First status read failed (%s); retrying once", err)
+            await asyncio.sleep(_SETTLE_SECONDS)
+            status = await self.get_status()
         # One-shot fetches; failures here are non-fatal — the panel is
         # working, we just don't get pretty names.
         try:
@@ -401,11 +422,13 @@ class ModernAdapter(PimaAdapter):
                 pass
             self._server = None
         self._connection_event.clear()
+        self._first_frame_event.clear()
 
     # ─── Frame handling ───────────────────────────────────────────────────
 
     async def _on_frame(self, frame: dict) -> None:
         _LOGGER.debug("AS→HA frame: %s", frame)
+        self._first_frame_event.set()
         # Auto-learn the panel's account id from the first frame that has it.
         if self._account is None and "account" in frame:
             self._account = int(frame["account"])

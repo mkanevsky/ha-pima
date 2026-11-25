@@ -73,6 +73,25 @@ async def async_setup_entry(
     )
 
 
+def _pima_device_info(entry: ConfigEntry) -> DeviceInfo:
+    """Device info for both families; Force entries have no host."""
+    host = entry.data.get(CONF_HOST)
+    if host:
+        return DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=f"PIMA {host}",
+            manufacturer="PIMA Electronic Systems",
+            model="Hunter Pro (legacy)",
+            configuration_url=f"http://{host}",
+        )
+    return DeviceInfo(
+        identifiers={(DOMAIN, entry.entry_id)},
+        name=f"PIMA Force (listen :{entry.data.get('listen_port')})",
+        manufacturer="PIMA Electronic Systems",
+        model="Force / Vision",
+    )
+
+
 class PimaAlarmPanel(CoordinatorEntity[PimaCoordinator], AlarmControlPanelEntity):
     """One alarm_control_panel entity per configured partition."""
 
@@ -88,7 +107,6 @@ class PimaAlarmPanel(CoordinatorEntity[PimaCoordinator], AlarmControlPanelEntity
     ) -> None:
         super().__init__(coordinator)
         self._partition = partition
-        host = entry.data[CONF_HOST]
         require_code = entry.options.get(CONF_REQUIRE_CODE, DEFAULT_REQUIRE_CODE)
         # When the user wants RTI-style "no code" behaviour we hide the
         # keypad entirely and ignore whatever HA passes to arm/disarm
@@ -101,13 +119,7 @@ class PimaAlarmPanel(CoordinatorEntity[PimaCoordinator], AlarmControlPanelEntity
         self._attr_unique_id = f"{entry.entry_id}-partition-{partition}"
         self._attr_translation_key = "partition"
         self._attr_name = f"Partition {partition}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=f"PIMA {host}",
-            manufacturer="PIMA Electronic Systems",
-            model="Hunter Pro (legacy)",
-            configuration_url=f"http://{host}",
-        )
+        self._attr_device_info = _pima_device_info(entry)
         # Tracks an in-flight transition so the entity can show ARMING /
         # DISARMING in the UI while the panel runs its exit delay. The
         # legacy protocol has no explicit "in transit" byte, so we manage

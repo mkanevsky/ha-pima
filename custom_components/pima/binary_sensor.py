@@ -48,13 +48,21 @@ async def async_setup_entry(
 
 
 def _device_info(entry: ConfigEntry) -> DeviceInfo:
-    host = entry.data[CONF_HOST]
+    """Device info for both families; Force entries have no host."""
+    host = entry.data.get(CONF_HOST)
+    if host:
+        return DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=f"PIMA {host}",
+            manufacturer="PIMA Electronic Systems",
+            model="Hunter Pro (legacy)",
+            configuration_url=f"http://{host}",
+        )
     return DeviceInfo(
         identifiers={(DOMAIN, entry.entry_id)},
-        name=f"PIMA {host}",
+        name=f"PIMA Force (listen :{entry.data.get('listen_port')})",
         manufacturer="PIMA Electronic Systems",
-        model="Hunter Pro (legacy)",
-        configuration_url=f"http://{host}",
+        model="Force / Vision",
     )
 
 
